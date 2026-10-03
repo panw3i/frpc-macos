@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FRP 测试页 · 8888</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+      background: #f4f4f5;
+      color: #1d1d1f;
+    }
+    main {
+      width: min(420px, 92vw);
+      padding: 28px 32px;
+      border-radius: 16px;
+      background: #fff;
+      box-shadow: 0 8px 32px rgba(0,0,0,.08);
+    }
+    h1 { font-size: 22px; margin: 0 0 8px; }
+    p { margin: 0 0 12px; color: #6e6e73; }
+    code { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+    .ok { color: #248a3d; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="ok">本机 8888 通了</div>
+    <h1>Frpc Desktop 测试页</h1>
+    <p>若你从公网打开的是 <code>http://213.35.120.5:16888</code>，隧道就成功了。</p>
+    <p>时间：<span id="t"></span></p>
+  </main>
+  <script>
+    document.getElementById('t').textContent = new Date().toLocaleString();
+  </script>
+</body>
+</html>

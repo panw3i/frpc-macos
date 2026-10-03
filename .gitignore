@@ -1,0 +1,16 @@
+.DS_Store
+.grok/workflows/
+dist/
+*.zip
+
+# Flutter / Xcode
+frpc_macos/build/
+frpc_macos/.dart_tool/
+frpc_macos/.flutter-plugins
+frpc_macos/.flutter-plugins-dependencies
+frpc_macos/.idea/
+frpc_macos/*.iml
+frpc_macos/macos/Flutter/ephemeral/
+frpc_macos/macos/Pods/
+**/.swiftpm/
+**/xcuserdata/

@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Frpc Desktop agent CLI. JSON in/out for agents to operate channels and tunnels."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from http.client import HTTPConnection
+from pathlib import Path
+from typing import Any, Mapping
+
+APP_ID = "net.bytenote.frpcMacos"
+DATA_DIR = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / APP_ID
+    / "FrpcDesktop"
+)
+SOCK = Path(os.environ.get("FRPC_AGENT_SOCK", DATA_DIR / "agent.sock"))
+CONFIG = DATA_DIR / "config.json"
+APP_CANDIDATES = [
+    Path(p)
+    for p in [
+        os.environ.get("FRPC_APP", ""),
+        "/Users/pan/Desktop/frp/dist/Frpc Desktop.app",
+        "/Applications/Frpc Desktop.app",
+    ]
+    if p
+]
+
+
+class UnixHTTPConnection(HTTPConnection):
+    def __init__(self, path: Path, timeout: float = 8) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self._path = str(path)
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._path)
+        self.sock = sock
+
+
+def emit(payload: Mapping[str, Any], code: int = 0) -> int:
+    json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+    return code
+
+
+def fail(message: str, error: str = "error", **extra: Any) -> int:
+    body: dict[str, Any] = {"ok": False, "error": error, "message": message}
+    body.update(extra)
+    return emit(body, 1)
+
+
+def request(
+    method: str,
+    path: str,
+    body: Mapping[str, Any] | None = None,
+    query: Mapping[str, Any] | None = None,
+    launch: bool = False,
+) -> tuple[int, dict[str, Any]]:
+    if launch:
+        ensure_app()
+    if not SOCK.exists():
+        raise FileNotFoundError(str(SOCK))
+    conn = UnixHTTPConnection(SOCK)
+    url = path
+    if query:
+        parts = [f"{k}={v}" for k, v in query.items() if v not in (None, "")]
+        if parts:
+            url = f"{path}?{'&'.join(parts)}"
+    payload = None if body is None else json.dumps(body).encode()
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    conn.request(method, url, body=payload, headers=headers)
+    res = conn.getresponse()
+    raw = res.read().decode()
+    conn.close()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        data = {"ok": False, "error": "bad_response", "message": raw}
+    if not isinstance(data, dict):
+        data = {"ok": False, "error": "bad_response", "message": raw}
+    return res.status, data
+
+
+def ensure_app(timeout: float = 10) -> None:
+    if SOCK.exists():
+        return
+    app = next((p for p in APP_CANDIDATES if p.exists()), None)
+    if app is None:
+        return
+    subprocess.Popen(
+        ["open", str(app)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if SOCK.exists():
+            time.sleep(0.2)
+            return
+        time.sleep(0.15)
+
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG.exists():
+        return {}
+    return json.loads(CONFIG.read_text())
+
+
+def offline_status() -> dict[str, Any]:
+    cfg = load_config()
+    servers = cfg.get("servers") or []
+    return {
+        "ok": True,
+        "app": False,
+        "dataDir": str(DATA_DIR),
+        "frpc": cfg.get("selectedFrpcPath"),
+        "selectedServerId": cfg.get("selectedServerId"),
+        "connectedCount": 0,
+        "servers": [
+            {
+                **s,
+                "label": s.get("name") or s.get("addr") or "未命名",
+                "ready": bool(str(s.get("addr") or "").strip())
+                and bool(str(s.get("token") or "").strip()),
+                "connected": False,
+                "error": None,
+                "proxies": s.get("proxies") or [],
+            }
+            for s in servers
+        ],
+        "message": "Frpc Desktop is not running; showing saved config",
+    }
+
+
+def live(method: str, path: str, **kwargs: Any) -> int:
+    launch = kwargs.pop("launch", method != "GET")
+    try:
+        _, data = request(method, path, launch=launch, **kwargs)
+    except FileNotFoundError:
+        if method == "GET" and path in ("/v1/status", "/v1/servers", "/v1/tunnels"):
+            data = offline_status()
+            if path == "/v1/servers":
+                data = {"ok": True, "app": False, "servers": data["servers"]}
+            elif path == "/v1/tunnels":
+                tunnels = []
+                for s in data["servers"]:
+                    for p in s.get("proxies") or []:
+                        tunnels.append({**p, "serverId": s.get("id"), "server": s.get("label")})
+                q = kwargs.get("query") or {}
+                sid = q.get("server")
+                if sid:
+                    tunnels = [t for t in tunnels if t.get("serverId") == sid]
+                data = {"ok": True, "app": False, "tunnels": tunnels}
+            return emit(data)
+        return fail(
+            "Frpc Desktop is not running (no agent.sock)",
+            error="app_not_running",
+            sock=str(SOCK),
+        )
+    except OSError as e:
+        return fail(str(e), error="connect_failed", sock=str(SOCK))
+    code = 0 if data.get("ok", True) else 1
+    return emit(data, code)
+
+
+def cmd_status(_: argparse.Namespace) -> int:
+    return live("GET", "/v1/status")
+
+
+def cmd_help(_: argparse.Namespace) -> int:
+    return live("GET", "/v1/help", launch=False)
+
+
+def cmd_servers(ns: argparse.Namespace) -> int:
+    action = ns.servers_cmd
+    if action in (None, "list"):
+        return live("GET", "/v1/servers")
+    if action == "get":
+        return live("GET", f"/v1/servers/{ns.id}")
+    if action == "add":
+        return live(
+            "POST",
+            "/v1/servers",
+            body={
+                "name": ns.name,
+                "addr": ns.addr,
+                "port": ns.port,
+                "token": ns.token,
+                "user": ns.user,
+            },
+        )
+    if action == "update":
+        body = {
+            k: v
+            for k, v in {
+                "name": ns.name,
+                "addr": ns.addr,
+                "port": ns.port,
+                "token": ns.token,
+                "user": ns.user,
+            }.items()
+            if v is not None
+        }
+        return live("PATCH", f"/v1/servers/{ns.id}", body=body)
+    if action in ("rm", "remove", "delete"):
+        return live("DELETE", f"/v1/servers/{ns.id}")
+    if action == "select":
+        return live("POST", f"/v1/servers/{ns.id}/select")
+    return fail(f"unknown servers action {action}")
+
+
+def cmd_tunnels(ns: argparse.Namespace) -> int:
+    action = ns.tunnels_cmd
+    if action in (None, "list"):
+        return live("GET", "/v1/tunnels", query={"server": ns.server})
+    if action == "add":
+        return live(
+            "POST",
+            "/v1/tunnels",
+            body={
+                "server": ns.server,
+                "name": ns.name,
+                "type": ns.type,
+                "localIp": ns.local_ip,
+                "localPort": ns.local,
+                "remotePort": ns.remote,
+                "domain": ns.domain,
+                "subdomain": ns.subdomain,
+                "enabled": ns.enabled,
+            },
+        )
+    if action == "update":
+        body = {
+            k: v
+            for k, v in {
+                "name": ns.name,
+                "type": ns.type,
+                "localIp": ns.local_ip,
+                "localPort": ns.local,
+                "remotePort": ns.remote,
+                "domain": ns.domain,
+                "subdomain": ns.subdomain,
+                "enabled": ns.enabled,
+            }.items()
+            if v is not None
+        }
+        return live("PATCH", f"/v1/tunnels/{ns.id}", body=body)
+    if action in ("rm", "remove", "delete"):
+        return live("DELETE", f"/v1/tunnels/{ns.id}")
+    return fail(f"unknown tunnels action {action}")
+
+
+def cmd_connect(ns: argparse.Namespace) -> int:
+    if ns.id:
+        return live("POST", f"/v1/servers/{ns.id}/connect")
+    return live("POST", "/v1/connect")
+
+
+def cmd_disconnect(ns: argparse.Namespace) -> int:
+    if ns.id:
+        return live("POST", f"/v1/servers/{ns.id}/disconnect")
+    return live("POST", "/v1/disconnect")
+
+
+def cmd_logs(ns: argparse.Namespace) -> int:
+    if ns.clear:
+        return live("POST", "/v1/logs/clear")
+    return live(
+        "GET",
+        "/v1/logs",
+        query={"tail": ns.tail, "server": ns.server},
+        launch=False,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="frpc-agent",
+        description="Operate Frpc Desktop from an agent or shell. Prints JSON.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="app, channels, tunnels, live stats")
+    sub.add_parser("help", help="control API map")
+
+    sp = sub.add_parser("servers", help="list/add/update/remove channels")
+    ss = sp.add_subparsers(dest="servers_cmd")
+    ss.add_parser("list")
+    g = ss.add_parser("get")
+    g.add_argument("id")
+    a = ss.add_parser("add")
+    a.add_argument("--name")
+    a.add_argument("--addr", required=True)
+    a.add_argument("--port", type=int, default=7000)
+    a.add_argument("--token", required=True)
+    a.add_argument("--user")
+    u = ss.add_parser("update")
+    u.add_argument("id")
+    u.add_argument("--name")
+    u.add_argument("--addr")
+    u.add_argument("--port", type=int)
+    u.add_argument("--token")
+    u.add_argument("--user")
+    r = ss.add_parser("rm")
+    r.add_argument("id")
+    se = ss.add_parser("select")
+    se.add_argument("id")
+
+    tp = sub.add_parser("tunnels", help="list/add/update/remove tunnels")
+    ts = tp.add_subparsers(dest="tunnels_cmd")
+    tl = ts.add_parser("list")
+    tl.add_argument("--server")
+    ta = ts.add_parser("add")
+    ta.add_argument("--server", required=True)
+    ta.add_argument("--name")
+    ta.add_argument("--type", default="tcp", choices=["tcp", "udp", "http", "https"])
+    ta.add_argument("--local-ip", default="127.0.0.1")
+    ta.add_argument("--local", type=int, help="localPort")
+    ta.add_argument("--remote", type=int, help="remotePort")
+    ta.add_argument("--domain", help="http/https customDomains or subdomain")
+    ta.add_argument("--subdomain")
+    ta.add_argument("--enabled", default=True, action=argparse.BooleanOptionalAction)
+    tu = ts.add_parser("update")
+    tu.add_argument("id")
+    tu.add_argument("--name")
+    tu.add_argument("--type", choices=["tcp", "udp", "http", "https"])
+    tu.add_argument("--local-ip")
+    tu.add_argument("--local", type=int)
+    tu.add_argument("--remote", type=int)
+    tu.add_argument("--domain")
+    tu.add_argument("--subdomain")
+    tu.add_argument("--enabled", action=argparse.BooleanOptionalAction)
+    tr = ts.add_parser("rm")
+    tr.add_argument("id")
+
+    c = sub.add_parser("connect", help="connect one channel or every ready channel")
+    c.add_argument("id", nargs="?")
+    d = sub.add_parser("disconnect", help="disconnect one channel or every channel")
+    d.add_argument("id", nargs="?")
+
+    lg = sub.add_parser("logs", help="recent log lines")
+    lg.add_argument("--tail", default="80")
+    lg.add_argument("--server")
+    lg.add_argument("--clear", action="store_true")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    ns = parser.parse_args(argv)
+    if ns.cmd == "status":
+        return cmd_status(ns)
+    if ns.cmd == "help":
+        return cmd_help(ns)
+    if ns.cmd == "servers":
+        return cmd_servers(ns)
+    if ns.cmd == "tunnels":
+        return cmd_tunnels(ns)
+    if ns.cmd == "connect":
+        return cmd_connect(ns)
+    if ns.cmd == "disconnect":
+        return cmd_disconnect(ns)
+    if ns.cmd == "logs":
+        return cmd_logs(ns)
+    return fail(f"unknown command {ns.cmd}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

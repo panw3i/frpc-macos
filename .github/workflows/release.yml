@@ -1,0 +1,55 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Enable macOS desktop
+        run: flutter config --enable-macos-desktop
+
+      - name: Test
+        working-directory: frpc_macos
+        run: flutter test
+
+      - name: Build
+        working-directory: frpc_macos
+        run: flutter build macos --release
+
+      - name: Zip app
+        run: |
+          APP="frpc_macos/build/macos/Build/Products/Release/Frpc Desktop.app"
+          test -d "$APP"
+          ditto -c -k --keepParent "$APP" Frpc-Desktop-macos.zip
+          ls -lh Frpc-Desktop-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Frpc-Desktop-macos
+          path: Frpc-Desktop-macos.zip
+          if-no-files-found: error
+
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" Frpc-Desktop-macos.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Frpc Desktop $GITHUB_REF_NAME" \
+            --generate-notes
